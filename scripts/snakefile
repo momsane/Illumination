@@ -1,0 +1,536 @@
+#wd=/work/FAC/FBM/DMF/pengel/general_data/Illumina_genomes/workflow/scripts
+#command to symlink scratch: ln -s /scratch/mgarci14 ../../results/scratch
+#workflow = scripts, envs, config
+#data
+#results
+#logs
+#benchmarks
+
+config_file = "../config/metadata.tsv"
+
+# Import packages
+import numpy as np
+import pandas as pd
+
+#Read config file
+metadata = pd.read_table(config_file, sep='\t', header=0).set_index('sample', drop = False)
+
+#List samples to include for the read pre-processing and assembly
+SAMPLES_ASS = metadata['sample'].tolist()
+
+#List samples to include for the downstream genome analysis
+#SAMPLES_ANNOT = metadata.loc[metadata['include_downstream'] == 1, 'sample'].tolist()
+
+# Put here the paths to the raw reads folder on the cluster
+ILLUMINA_RAW = "../../data/raw_reads"
+
+rule all:
+    input:
+        # First chunk: Illumina reads QC
+        "../../results/preprocessing/check_integrity/integrity_files.txt",
+        "../../results/preprocessing/count_reads_bt/count_reads_bt.txt",
+        "../../results/preprocessing/fastqc_pretrim/all",
+        # Second chunk: adapter trimming and assembly
+        "../../results/preprocessing/fastqc_posttrim/all",
+        "../../results/assembly/QC/multiquast",
+        expand("../../results/assembly/spades/contigs_filtered/{sample}_contigs_filtered.fasta", sample = SAMPLES_ASS),
+        # "../../results/checkm"
+
+        
+# The pipeline assumes the reads from different lanes are already
+# concatenated into a single file 
+
+############################ Reads processing ############################
+
+# File names should be something like: {sample}_R1.fastq.gz
+
+# First we QC the Illumina reads
+
+## Check that all raw read files are complete
+# Not needed if you could verify the md5sums
+
+rule gzip_test:
+    input:
+        R1 = ILLUMINA_RAW + "/{sample}_R1.fastq.gz",
+        R2 = ILLUMINA_RAW + "/{sample}_R2.fastq.gz",
+    output:
+        "../../results/preprocessing/check_integrity/samples/{sample}.txt"
+    log:
+        "../../logs/preprocessing/check_integrity/samples/{sample}.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "20m",
+        mem_mb = 500
+    shell:
+        """
+        if gzip -t {input.R1}; then
+            echo {input.R1}": OK" > {output}
+        else 
+            echo {input.R1}": Inappropriate file type or format" > {output}
+        fi
+        if gzip -t {input.R2}; then
+            echo {input.R2}": OK" >> {output}
+        else 
+            echo {input.R2}": Inappropriate file type or format" >> {output}
+        fi
+        """
+
+# Incomplete/empty files are now printed to one file.
+# Check the output of the following rule
+
+rule check_integrity:
+    input:
+        expand("../../results/preprocessing/check_integrity/samples/{sample}.txt", sample = SAMPLES_ASS)
+    output:
+        "../../results/preprocessing/check_integrity/integrity_files.txt"
+    log:
+        "../../logs/preprocessing/check_integrity/all.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "10m",
+        mem_mb = 100
+    shell:
+        """
+        echo {input} | xargs cat >> {output}
+        """
+
+# Count number of reads in each fastq file before trimming.
+
+rule count_reads_bt:
+    input:
+        R1 = ILLUMINA_RAW + "/{sample}_R1.fastq.gz",
+        R2 = ILLUMINA_RAW + "/{sample}_R2.fastq.gz",
+    output:
+        "../../results/preprocessing/count_reads_bt/samples/count_reads_bt_{sample}.txt"
+    params:
+        tmp = "../../results/preprocessing/count_reads_bt/samples/count_reads_bt_{sample}.temp.txt"
+    conda:
+        "../envs/seqkit-2.6.1.yaml"
+    log:
+        "../../logs/preprocessing/count_reads_bt/samples/{sample}.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "1h",
+        mem_mb = 2000
+    shell:
+        """ 
+        seqkit stats -T -b -e {input.R1} > {params.tmp};
+        seqkit stats -T -b -e {input.R2} >> {params.tmp};
+        cat {params.tmp} | awk -v sample={wildcards.sample} 'NR == 2 {{print sample"\tR1\t"$0}}' > {output};
+        cat {params.tmp} | awk -v sample={wildcards.sample} 'NR == 2 {{print sample"\tR2\t"$0}}' >> {output};
+        rm {params.tmp}
+        """
+
+# Combining all the samples stats into one file 
+
+rule combine_readcounts_bt:
+    input:
+        expand("../../results/preprocessing/count_reads_bt/samples/count_reads_bt_{sample}.txt", sample = SAMPLES_ASS)
+    output:
+        "../../results/preprocessing/count_reads_bt/count_reads_bt.txt"
+    log:
+        "../../logs/preprocessing/count_reads_bt/combine_readcounts.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "30m",
+        mem_mb = 1000
+    shell:
+        """
+        echo -e "sample\tread\tfile\tformat\ttype\tnum_seqs\tsum_len\tmin_len\tavg_len\tmax_len" > {output};
+        echo {input} | xargs cat >> {output}
+        """
+
+rule fastqc_bt:
+    input:
+        R1 = ILLUMINA_RAW + "/{sample}_R1.fastq.gz",
+        R2 = ILLUMINA_RAW + "/{sample}_R2.fastq.gz",
+    output:
+        directory("../../results/preprocessing/fastqc_pretrim/samples/{sample}")
+    conda:
+        "../envs/fastqc-0.11.8.yaml"
+    log:
+        "../../logs/preprocessing/fastqc_pretrim/samples/{sample}.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "1h",
+        mem_mb = 1000
+    shell:
+        """
+        mkdir -p {output};
+        fastqc -o {output} {input.R1} {input.R2}
+        """
+
+# Compile and visualize all fastqc reports together
+
+rule multiqc_fastqc_bt:
+    input:
+        expand("../../results/preprocessing/fastqc_pretrim/samples/{sample}", sample = SAMPLES_ASS)
+    output:
+        directory("../../results/preprocessing/fastqc_pretrim/all")
+    conda:
+        "../envs/multiqc-1.6.yaml"
+    params:
+        ignore = ".zip"
+    log:
+        "../../logs/preprocessing/fastqc_pretrim/multiqc.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "30m",
+        mem_mb = 2000
+    shell:
+        "multiqc --interactive -f --ignore {params.ignore} -o {output} {input}"
+
+# The metadata file is updated to indicate the adapter content and read length
+# Then you need to upload the correct adapter sequence(s) to the data folder
+
+### Trimming
+
+def determine_adapters(wildcards):
+    adapt=metadata.loc[metadata['sample'] == wildcards.sample, 'adapter'].item()
+    if (adapt=='NT'):
+        return '../../data/adapters/Nextera_Transposase.fa'
+    elif (adapt=='IU'):
+        return '../../data/adapters/Illumina_Universal.fa'
+    elif (adapt=='TS'):
+        return '../../data/adapters/TruSeq.fa'
+
+def determine_k(wildcards):
+    adapt=metadata.loc[metadata['sample'] == wildcards.sample, 'adapter'].item()
+    if (adapt=='NT'):
+        return 31 #maximum allowed by bbduk
+    elif (adapt=='IU'):
+        return 19
+    elif (adapt=='TS'):
+        return 31 
+
+# hdist is set to 2 to allow for 2 mismatches in the adapter sequence
+# which more stringent than the default of 1
+
+rule bbduk_adapt:
+    input:
+        R1 = ILLUMINA_RAW + "/{sample}_R1.fastq.gz",
+        R2 = ILLUMINA_RAW + "/{sample}_R2.fastq.gz",
+    output:
+        trim1 = "../../results/preprocessing/trimmed_reads/{sample}_R1.trim.fastq.gz",
+        trim2 = "../../results/preprocessing/trimmed_reads/{sample}_R2.trim.fastq.gz"
+    params:
+        adapt = determine_adapters,
+        k = determine_k,
+        mink = 11,
+        hdist = 2,
+        hdist2 = 0,
+        overlap = 12,
+        minlen = 40,
+        q = 26
+    log:
+        "../../logs/preprocessing/read_trimming/{sample}_trimming"
+    threads: 2
+    conda:
+        "../envs/bbmap-39.01.yaml"
+    resources:
+        account = "pengel_general_data",
+        runtime = "1h",
+        mem_mb = 2000
+    shell:
+        """
+        bbduk.sh in={input.R1} in2={input.R2} out={output.trim1} out2={output.trim2} \
+        ref={params.adapt} ktrim=r k={params.k} mink={params.mink} \
+        hdist={params.hdist} hdist2={params.hdist2} \
+        tpe=t tbo=t minoverlap={params.overlap} minlen={params.minlen} rcomp=f \
+        qtrim=rl trimq={params.q}
+        """
+
+# Run fastqc after trimming
+
+rule fastqc_pt:
+    input:
+        R1 = "../../results/preprocessing/trimmed_reads/{sample}_R1.trim.fastq.gz",
+        R2 = "../../results/preprocessing/trimmed_reads/{sample}_R2.trim.fastq.gz"
+    output:
+        directory("../../results/preprocessing/fastqc_posttrim/samples/{sample}")
+    conda:
+        "../envs/fastqc-0.11.8.yaml"
+    log:
+        "../../logs/preprocessing/fastqc_posttrim/samples/{sample}.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "1h",
+        mem_mb = 1000
+    shell:
+        """
+        mkdir -p {output};
+        fastqc -o {output} {input.R1} {input.R2}
+        """
+
+# Compile and visualize all fastqc reports together
+
+rule multiqc_fastqc_pt:
+    input:
+        expand("../../results/preprocessing/fastqc_posttrim/samples/{sample}", sample = SAMPLES_ASS)
+    output:
+        directory("../../results/preprocessing/fastqc_posttrim/all")
+    conda:
+        "../envs/multiqc-1.6.yaml"
+    params:
+        ignore = ".zip"
+    log:
+        "../../logs/preprocessing/fastqc_posttrim/multiqc.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "30m",
+        mem_mb = 2000
+    shell:
+        "multiqc --interactive -f --ignore {params.ignore} -o {output} {input}"
+
+rule spades:
+    input:
+        R1 = "../../results/preprocessing/trimmed_reads/{sample}_R1.trim.fastq.gz",
+        R2 = "../../results/preprocessing/trimmed_reads/{sample}_R2.trim.fastq.gz"
+    output:
+        contigs = "../../results/assembly/spades/contigs/{sample}_contigs.fasta",
+        graph = "../../results/assembly/spades/graphs/{sample}_graph.fastg",
+        log = "../../results/assembly/spades/logs/{sample}_log.txt"
+    params:
+        outdir = directory("../../results/scratch/spades"),
+        fcont = directory("../../results/assembly/spades/contigs"),
+        flog = directory("../../results/assembly/spades/logs"),
+        fgraph = directory("../../results/assembly/spades/graphs")
+    conda:
+        "../envs/spades-3.15.5.yaml"
+    log:
+        "../../logs/spades/{sample}.log"
+    threads: 24
+    resources:
+        account = "pengel_general_data",
+        runtime = "8h",
+        mem_mb = 40000
+    shell:
+        """
+        mkdir -p {params.outdir};
+        mkdir -p {params.fcont};
+        mkdir -p {params.flog};
+        mkdir -p {params.fgraph};
+        spades.py --isolate --pe1-1 {input.R1} --pe1-2 {input.R2} \
+        -o {params.outdir}/{wildcards.sample}_assembly -t {threads};
+        cp {params.outdir}/{wildcards.sample}_assembly/contigs.fasta {output.contigs};
+        cp {params.outdir}/{wildcards.sample}_assembly/assembly_graph.fastg {output.graph};
+        cp {params.outdir}/{wildcards.sample}_assembly/spades.log {output.log}
+        """
+
+# QC of assemblies using QUAST. Minimum contig length to include it is 500 bp (default for QUAST).
+
+rule quast:
+    input:
+        "../../results/assembly/spades/contigs/{sample}_contigs.fasta"
+    output:
+        directory("../../results/assembly/QC/quast/{sample}_quast")
+    log:
+        "../../logs/quast/{sample}.log"
+    conda:
+        "../envs/quast-5.2.0.yaml"
+    threads: 4
+    resources:
+        account = "pengel_general_data",
+        runtime = "4h",
+        mem_mb = 40000
+    shell:
+        """
+        quast.py --no-snps --no-sv --memory-efficient --max-ref-number 0 -o {output} -t {threads} {input}
+        """
+
+# Aggregate results
+
+rule multiqc_metaquast:
+    input:
+        expand("../../results/assembly/QC/quast/{sample}_quast", sample = SAMPLES_ASS)
+    output:
+        directory("../../results/assembly/QC/multiquast")
+    conda:
+        "../envs/multiqc-1.6.yaml"
+    log:
+        "../../logs/assembly/multiqc_quast/multiqc.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "30m",
+        mem_mb = 2000
+    shell:
+        "multiqc --interactive -f -o {output} {input}"
+        
+# Next we want to:
+# (1) filter contigs to retain only the ones > 1000 bp and with a minimum read coverage of 1
+# (2) rename contigs like so: sample_contignumber_length.
+
+rule filter_rename_contigs:
+    input:
+        contigs = "../../results/assembly/spades/contigs/{sample}_contigs.fasta",
+        awk_script = "filter_contigs_spades.awk"
+    output:
+        keep = "../../results/assembly/spades/contigs_filtered/{sample}_contigs_filtered.fasta",
+        discard = "../../results/assembly/spades/contigs_discarded/{sample}_contigs_discarded.fasta",
+        stats = "../../results/assembly/spades/stats/{sample}_contig_stats.txt"
+    params:
+        dirk = "../../results/assembly/spades/contigs_filtered",
+        dird = "../../results/assembly/spades/contigs_discarded",
+        cp = "../../results/assembly/contigs_filtered"
+    log:
+        "../../logs/filter_contigs/spades_{sample}_spades.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "30m",
+        mem_mb = 1000
+    shell:
+        """
+        mkdir -p {params.dirk};
+        mkdir -p {params.dird};
+        mkdir -p {params.cp};
+        awk -v sample={wildcards.sample} -v fk={output.keep} -v fd={output.discard} -v fs={output.stats} \
+        -f {input.awk_script} {input.contigs};
+        cp {output.keep} {params.cp}/{wildcards.sample}_contigs_filtered.fasta
+        """
+        
+# Next we run checkM to assess the quality of the assemblies
+
+rule checkm:
+    input:
+        expand("../../results/assembly/spades/contigs_filtered/{sample}_contigs_filtered.fasta", sample = SAMPLES_ASS),
+    output:
+        fld = directory("../../results/checkm"),
+        rextended = "../../results/checkm/checkm_report_extended.txt"
+    params:
+        fld = "../../results/final_assemblies",
+        extension = "fasta",
+        tmpdir = "../../results/scratch/checkm.tmp",
+        tmprep = "../../results/checkm/checkm_report_simple.txt",
+        lineage = "../../results/checkm/lineage.ms"
+    log:
+        "../../logs/checkm.log"
+    conda:
+        "../envs/checkm-1.2.2.yaml"
+    threads: 2
+    resources:
+        account = "pengel_general_data",
+        mem_mb = 100000,
+        runtime = "1h"
+    shell:
+        """
+        mkdir -p {params.tmpdir};
+        checkm lineage_wf -f {params.tmprep} --tab_table -x {params.extension} \
+        -t {threads} --tmpdir {params.tmpdir} {params.fld} {output.fld};
+        checkm qa -o 2 -f {output.rextended} --tab_table --tmpdir {params.tmpdir} \
+        -t {threads} {params.lineage} {output.fld};
+        rm {params.tmprep};
+        rm -rf {params.tmpdir}
+        """
+
+# Check the checkM output to see if the genomes seem complete
+# From here only complete genomes will be further processed
+
+
+# TODO
+# - GTDB-Tk
+# - DRAM
+# - Defense finder
+# - barrnap?
+# - RGI
+
+############################ ANNOTATION ##########################################
+
+# rule checkm_plots:
+#     input:
+#         dir_asmbl="../results/ONT_assembly/final_assemblies/",
+#         dir_checkm="../results/ONT_assembly/checkm_QC/"
+#     output:
+#         dir=directory("../results/ONT_assembly/checkm_QC/checkm_plots/")
+#     log:
+#         "logs/annot_QC/checkm/plot_checkm.log"
+#     threads: 8
+#     conda:
+#         "envs/checkm_env.yaml"
+#     resources:
+#         account = "pengel_beemicrophage",
+#         mem_mb = 5000,
+#         runtime= "01:00:00"
+#     shell:
+#         "checkm marker_plot {input.dir_checkm} {input.dir_asmbl} {output.dir} -x fasta --image_type svg; "
+#         "checkm coding_plot {input.dir_checkm} {input.dir_asmbl} {output.dir} 0 -x fasta --image_type svg; "
+#         "checkm gc_plot {input.dir_asmbl} {output.dir} 0 -x fasta --image_type svg"
+
+# rule DRAM_annot:
+#     input:
+#         asmbl="../results/ONT_assembly/final_assemblies/{sample}_third_Pilon_Assembly.fasta",
+#         checkm="../results/ONT_assembly/checkm_QC/checkm_QC_stats.txt",
+#         config="../resources/dram_config/DRAM_config.txt"
+#     output:
+#         dir=directory("../results/genomes_anntations/{sample}_annot_genome")
+#     log:
+#         "logs/annot_QC/dram/{sample}_annotation.log"
+#     threads: 10
+#     # conda:
+#     #     "envs/dram.yaml" TODO does not work fails at pfam step --> using cluster one
+#     resources:
+#         account = "pengel_beemicrophage",
+#         mem_mb = 100000,
+#         runtime= "01:00:00"
+#     shell:
+#         #"(DRAM-setup.py import_config --config_loc {input.config}) 2> {log}; " #useful only if using conda dram_env
+#         "source /etc/profile.d/lmodstacks.sh; " #import modules for DRAM
+#         "export PATH=/dcsrsoft/spack/external/dram/v1.2.4/bin:$PATH; "
+#         "dcsrsoft use old; "
+#         "module load gcc/9.3.0 python; "
+#         "module load hmmer mmseqs2 prodigal infernal trnascan-se barrnap; "
+#         "(DRAM.py annotate -i {input.asmbl} \
+#          -o {output.dir} --min_contig_size 999 \
+#          --threads {threads} --verbose \
+#          --checkm_quality {input.checkm}) 2> {log}" #annotate genomes with DRAM
+
+# rule DRAM_distill:
+#     input:
+#         dir="../results/genomes_anntations/{sample}_annot_genome"
+#     output:
+#         dir=directory("../results/genomes_anntations/{sample}_distill")
+#     log:
+#         "logs/annot_QC/dram/{sample}_distill.log"
+#     threads: 10
+#     # conda:
+#     #     "envs/dram.yaml" TODO does not work fails at pfam step --> using cluster one
+#     resources:
+#         account = "pengel_beemicrophage",
+#         mem_mb = 10000,
+#         runtime= "01:00:00"
+#     shell:
+#         #"(DRAM-setup.py import_config --config_loc {input.config}) 2> {log}; " #useful only if using conda dram_env
+#         "source /etc/profile.d/lmodstacks.sh; " #import modules for DRAM
+#         "export PATH=/dcsrsoft/spack/external/dram/v1.2.4/bin:$PATH; "
+#         "dcsrsoft use old; "
+#         "module load gcc/9.3.0 python; "
+#         "module load hmmer mmseqs2 prodigal infernal trnascan-se barrnap; "
+#         "(DRAM.py distill -i {input.dir}/annotations.tsv -o {output} --trna_path {input.dir}/trnas.tsv --rrna_path {input.dir}/rrnas.tsv) 2> {log}"
+
+# ###################################DEFENSE SYSTEMS ##########################################################################
+# rule DF_launch:
+#     input:
+#         faa="../results/genomes_anntations/{sample}_annot_genome/genes.faa"
+#     output:
+#         directory("../results/AVD_output/DF_output/{sample}_DF_output")
+#     conda:
+#         "envs/DF_env.yaml"
+#     threads: 10
+#     log:
+#         "logs/defense_systems/DF/{sample}_DF.log"
+#     resources:
+#         account = "pengel_beemicrophage",
+#         mem_mb = 10000,
+#         runtime= "00:30:00"
+#     shell:
+#         #"defense-finder update; " # run only the first time you launch this ule, Idk how to make it more elegant
+#         "(defense-finder run {input.faa} --out-dir {output}) 2> {log}"
