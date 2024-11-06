@@ -34,7 +34,7 @@ rule all:
         "../../results/preprocessing/fastqc_posttrim/all",
         "../../results/assembly/QC/multiquast",
         expand("../../results/assembly/spades/contigs_filtered/{sample}_contigs_filtered.fasta", sample = SAMPLES_ASS),
-        # "../../results/checkm"
+        "../../results/checkm"
 
         
 # The pipeline assumes the reads from different lanes are already
@@ -343,7 +343,7 @@ rule quast:
         mem_mb = 40000
     shell:
         """
-        quast.py --no-snps --no-sv --memory-efficient --max-ref-number 0 -o {output} -t {threads} {input}
+        quast.py --no-snps --no-sv --memory-efficient -o {output} -t {threads} {input}
         """
 
 # Aggregate results
