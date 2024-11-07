@@ -33,7 +33,7 @@ rule all:
         # Second chunk: adapter trimming and assembly
         "../../results/preprocessing/fastqc_posttrim/all",
         "../../results/assembly/QC/multiquast",
-        expand("../../results/assembly/spades/contigs_filtered/{sample}_contigs_filtered.fasta", sample = SAMPLES_ASS),
+        expand("../../results/assembly/spades/contigs_filtered/{sample}.fna", sample = SAMPLES_ASS),
         "../../results/checkm"
 
         
@@ -374,7 +374,7 @@ rule filter_rename_contigs:
         contigs = "../../results/assembly/spades/contigs/{sample}_contigs.fasta",
         awk_script = "filter_contigs_spades.awk"
     output:
-        keep = "../../results/assembly/spades/contigs_filtered/{sample}_contigs_filtered.fasta",
+        keep = "../../results/assembly/spades/contigs_filtered/{sample}.fna",
         discard = "../../results/assembly/spades/contigs_discarded/{sample}_contigs_discarded.fasta",
         stats = "../../results/assembly/spades/stats/{sample}_contig_stats.txt"
     params:
@@ -402,13 +402,13 @@ rule filter_rename_contigs:
 
 rule checkm:
     input:
-        expand("../../results/assembly/spades/contigs_filtered/{sample}_contigs_filtered.fasta", sample = SAMPLES_ASS),
+        expand("../../results/assembly/spades/contigs_filtered/{sample}.fna", sample = SAMPLES_ASS),
     output:
         fld = directory("../../results/checkm"),
         rextended = "../../results/checkm/checkm_report_extended.txt"
     params:
-        fld = "../../results/final_assemblies",
-        extension = "fasta",
+        fld = "../../results/assembly/spades/contigs_filtered",
+        extension = "fna",
         tmpdir = "../../results/scratch/checkm.tmp",
         tmprep = "../../results/checkm/checkm_report_simple.txt",
         lineage = "../../results/checkm/lineage.ms"
