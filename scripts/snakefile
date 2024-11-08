@@ -6,23 +6,21 @@
 #logs
 #benchmarks
 
-config_file = "../config/metadata.tsv"
+configfile: "../config/config.yaml"
+metadata_file = "../config/metadata.tsv"
 
 # Import packages
 import numpy as np
 import pandas as pd
 
 #Read config file
-metadata = pd.read_table(config_file, sep='\t', header=0).set_index('sample', drop = False)
+metadata = pd.read_table(metadata_file, sep='\t', header=0).set_index('sample', drop = False)
 
 #List samples to include for the read pre-processing and assembly
 SAMPLES_ASS = metadata['sample'].tolist()
 
 #List samples to include for the downstream genome analysis
-#SAMPLES_ANNOT = metadata.loc[metadata['include_downstream'] == 1, 'sample'].tolist()
-
-# Put here the paths to the raw reads folder on the cluster
-ILLUMINA_RAW = "../../data/raw_reads"
+SAMPLES_ANNOT = metadata.loc[metadata['include_downstream'] == 1, 'sample'].tolist()
 
 rule all:
     input:
@@ -34,25 +32,30 @@ rule all:
         "../../results/preprocessing/fastqc_posttrim/all",
         "../../results/assembly/QC/multiquast",
         expand("../../results/assembly/spades/contigs_filtered/{sample}.fna", sample = SAMPLES_ASS),
-        "../../results/checkm"
+        expand("../../results/assembly/assemblies_noname/{sample}.fna", sample = SAMPLES_ASS),
+        "../../results/checkm",
+        # Third chunk: annotation
+        "../../results/checkm_plots",
+        "../../results/gtdbtk_classify",
+        "../../results/annotation/DRAM_distill/ESL0755_DRAM_distill",
+        # expand("../../results/annotation/{sample}_DRAM_distill", sample = SAMPLES_ANNOT)
 
         
 # The pipeline assumes the reads from different lanes are already
 # concatenated into a single file 
 
-############################ Reads processing ############################
+# File names should be something like: {sample}_R1.fastq.gz for Illumina and {sample}.fastq.gz for ONT
 
-# File names should be something like: {sample}_R1.fastq.gz
+############################ Reads processing ############################
 
 # First we QC the Illumina reads
 
-## Check that all raw read files are complete
-# Not needed if you could verify the md5sums
+# Check that all raw read files are complete
 
 rule gzip_test:
     input:
-        R1 = ILLUMINA_RAW + "/{sample}_R1.fastq.gz",
-        R2 = ILLUMINA_RAW + "/{sample}_R2.fastq.gz",
+        R1 = config["Illumina_raw"] + "/{sample}_R1.fastq.gz",
+        R2 = config["Illumina_raw"] + "/{sample}_R2.fastq.gz",
     output:
         "../../results/preprocessing/check_integrity/samples/{sample}.txt"
     log:
@@ -100,8 +103,8 @@ rule check_integrity:
 
 rule count_reads_bt:
     input:
-        R1 = ILLUMINA_RAW + "/{sample}_R1.fastq.gz",
-        R2 = ILLUMINA_RAW + "/{sample}_R2.fastq.gz",
+        R1 = config["Illumina_raw"] + "/{sample}_R1.fastq.gz",
+        R2 = config["Illumina_raw"] + "/{sample}_R2.fastq.gz",
     output:
         "../../results/preprocessing/count_reads_bt/samples/count_reads_bt_{sample}.txt"
     params:
@@ -146,8 +149,8 @@ rule combine_readcounts_bt:
 
 rule fastqc_bt:
     input:
-        R1 = ILLUMINA_RAW + "/{sample}_R1.fastq.gz",
-        R2 = ILLUMINA_RAW + "/{sample}_R2.fastq.gz",
+        R1 = config["Illumina_raw"] + "/{sample}_R1.fastq.gz",
+        R2 = config["Illumina_raw"] + "/{sample}_R2.fastq.gz",
     output:
         directory("../../results/preprocessing/fastqc_pretrim/samples/{sample}")
     conda:
@@ -214,8 +217,8 @@ def determine_k(wildcards):
 
 rule bbduk_adapt:
     input:
-        R1 = ILLUMINA_RAW + "/{sample}_R1.fastq.gz",
-        R2 = ILLUMINA_RAW + "/{sample}_R2.fastq.gz",
+        R1 = config["Illumina_raw"] + "/{sample}_R1.fastq.gz",
+        R2 = config["Illumina_raw"] + "/{sample}_R2.fastq.gz",
     output:
         trim1 = "../../results/preprocessing/trimmed_reads/{sample}_R1.trim.fastq.gz",
         trim2 = "../../results/preprocessing/trimmed_reads/{sample}_R2.trim.fastq.gz"
@@ -372,17 +375,17 @@ rule multiqc_metaquast:
 rule filter_rename_contigs:
     input:
         contigs = "../../results/assembly/spades/contigs/{sample}_contigs.fasta",
-        awk_script = "filter_contigs_spades.awk"
+        awk_script = "filter_contigs.awk"
     output:
         keep = "../../results/assembly/spades/contigs_filtered/{sample}.fna",
-        discard = "../../results/assembly/spades/contigs_discarded/{sample}_contigs_discarded.fasta",
+        discard = "../../results/assembly/spades/contigs_discarded/{sample}_contigs_discarded.fna",
         stats = "../../results/assembly/spades/stats/{sample}_contig_stats.txt"
     params:
         dirk = "../../results/assembly/spades/contigs_filtered",
         dird = "../../results/assembly/spades/contigs_discarded",
         cp = "../../results/assembly/contigs_filtered"
     log:
-        "../../logs/filter_contigs/spades_{sample}_spades.log"
+        "../../logs/filter_contigs/{sample}.log"
     threads: 1
     resources:
         account = "pengel_general_data",
@@ -397,12 +400,36 @@ rule filter_rename_contigs:
         -f {input.awk_script} {input.contigs};
         cp {output.keep} {params.cp}/{wildcards.sample}_contigs_filtered.fasta
         """
+
+# A second version of the assembly with simplified fasta headers and 
+# without the sample name because DRAM will add it itself
+
+rule rename_contigs_noname:
+    input:
+        contigs = "../../results/assembly/spades/contigs_filtered/{sample}.fna",
+        awk_script = "filter_contigs_noname.awk"
+    output:
+        "../../results/assembly/assemblies_noname/{sample}.fna"
+    params:
+        fld = "../../results/assembly/assemblies_noname"
+    log:
+        "../../logs/filter_contigs_noname/{sample}.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "30m",
+        mem_mb = 1000
+    shell:
+        """
+        mkdir -p {params.fld};
+        awk -f {input.awk_script} {input.contigs} > {output}
+        """
         
 # Next we run checkM to assess the quality of the assemblies
 
 rule checkm:
     input:
-        expand("../../results/assembly/spades/contigs_filtered/{sample}.fna", sample = SAMPLES_ASS),
+        expand("../../results/assembly/spades/contigs_filtered/{sample}.fna", sample = SAMPLES_ASS)
     output:
         fld = directory("../../results/checkm"),
         rextended = "../../results/checkm/checkm_report_extended.txt"
@@ -413,7 +440,7 @@ rule checkm:
         tmprep = "../../results/checkm/checkm_report_simple.txt",
         lineage = "../../results/checkm/lineage.ms"
     log:
-        "../../logs/checkm.log"
+        "../../logs/checkm/checkm.log"
     conda:
         "../envs/checkm-1.2.2.yaml"
     threads: 2
@@ -435,102 +462,109 @@ rule checkm:
 # Check the checkM output to see if the genomes seem complete
 # From here only complete genomes will be further processed
 
+rule checkm_plots:
+    input:
+        assemblies = expand("../../results/assembly/spades/contigs_filtered/{sample}.fna", sample = SAMPLES_ASS),
+        dir_checkm = "../../results/checkm"
+    output:
+        fld = directory("../../results/checkm_plots")
+    params:
+        dir_asmbl = "../../results/assembly/spades/contigs_filtered",
+        extension = "fna"
+    benchmark:
+        "../../benchmarks/checkm_plots.benchmark"
+    log:
+        "../../logs/checkm/plot_checkm.log"
+    threads: 1
+    conda:
+        "../envs/checkm-1.2.2.yaml"
+    resources:
+        account = "pengel_general_data",
+        mem_mb = 2000,
+        runtime= "20m"
+    shell:
+        "checkm marker_plot {input.dir_checkm} {params.dir_asmbl} {output.fld} -x {params.extension} --image_type svg; "
+        "checkm coding_plot {input.dir_checkm} {params.dir_asmbl} {output.fld} 0 -x {params.extension} --image_type svg; "
+        "checkm gc_plot {params.dir_asmbl} {output.fld} 0 -x {params.extension} --image_type svg"
 
-# TODO
-# - GTDB-Tk
-# - DRAM
-# - Defense finder
-# - barrnap?
-# - RGI
+############################ Classification & annotation ##########################################
 
-############################ ANNOTATION ##########################################
+rule gtdb_classify:
+    input:
+        expand("../../results/assembly/spades/contigs_filtered/{sample}.fna", sample = SAMPLES_ASS)
+    output:
+        fld = directory("../../results/gtdbtk_classify"),
+        report = "../../results/gtdbtk_classify/classify/gtdbtk.bac120.summary.tsv"
+    log:
+        "../../logs/gtdbtk/gtdbtk_classify"
+    benchmark:
+        "../../benchmarks/gtdbtk_classify.benchmark"
+    params:
+        fld = "../../results/assembly/spades/contigs_filtered",
+        extension = "fna",
+        mashdb = config["Mash_db"],
+        tmpdir = "../../results/scratch/gtdbtk_classify/",
+        scratchdir = "../../results/scratch/gtdbtk_classify_pplacer"
+    conda:
+        "../envs/gtdbtk-2.4.0.yaml"
+    threads: 4
+    resources:
+        account = "pengel_general_data",
+        mem_mb = 20000,
+        runtime = "1h"
+    shell:
+        """
+        mkdir -p {params.tmpdir};
+        gtdbtk classify_wf --genome_dir {params.fld} --mash_db {params.mashdb} --scratch_dir {params.scratchdir} \
+        --out_dir {output.fld} --extension {params.extension} --cpus {threads} --tmpdir {params.tmpdir}
+        """
 
-# rule checkm_plots:
-#     input:
-#         dir_asmbl="../results/ONT_assembly/final_assemblies/",
-#         dir_checkm="../results/ONT_assembly/checkm_QC/"
-#     output:
-#         dir=directory("../results/ONT_assembly/checkm_QC/checkm_plots/")
-#     log:
-#         "logs/annot_QC/checkm/plot_checkm.log"
-#     threads: 8
-#     conda:
-#         "envs/checkm_env.yaml"
-#     resources:
-#         account = "pengel_beemicrophage",
-#         mem_mb = 5000,
-#         runtime= "01:00:00"
-#     shell:
-#         "checkm marker_plot {input.dir_checkm} {input.dir_asmbl} {output.dir} -x fasta --image_type svg; "
-#         "checkm coding_plot {input.dir_checkm} {input.dir_asmbl} {output.dir} 0 -x fasta --image_type svg; "
-#         "checkm gc_plot {input.dir_asmbl} {output.dir} 0 -x fasta --image_type svg"
+rule DRAM_annot:
+    input:
+        asmbl = "../../results/assembly/assemblies_noname/{sample}.fna",
+        checkm = "../../results/checkm/checkm_report_extended.txt",
+        gtdbtk = "../../results/gtdbtk_classify/classify/gtdbtk.bac120.summary.tsv",
+        config = "../config/dram-1.4.6_config.txt"
+    output:
+        directory("../../results/annotation/DRAM_annotate/{sample}_DRAM")
+    log:
+        "../../logs/annotation/dram/{sample}_dram.log"
+    conda:
+        "../envs/dram-1.4.6.yaml"
+    threads: 8
+    resources:
+        account = "pengel_general_data",
+        mem_mb = 100000,
+        runtime= "2h"
+    shell:
+        """
+        (DRAM-setup.py import_config --config_loc {input.config}) 2> {log};
+        (DRAM.py annotate -i {input.asmbl} \
+         -o {output} --min_contig_size 999 \
+         --threads {threads} --verbose \
+         --checkm_quality {input.checkm} --gtdb_taxonomy {input.gtdbtk}) 2> {log} 
+         """
 
-# rule DRAM_annot:
-#     input:
-#         asmbl="../results/ONT_assembly/final_assemblies/{sample}_third_Pilon_Assembly.fasta",
-#         checkm="../results/ONT_assembly/checkm_QC/checkm_QC_stats.txt",
-#         config="../resources/dram_config/DRAM_config.txt"
-#     output:
-#         dir=directory("../results/genomes_anntations/{sample}_annot_genome")
-#     log:
-#         "logs/annot_QC/dram/{sample}_annotation.log"
-#     threads: 10
-#     # conda:
-#     #     "envs/dram.yaml" TODO does not work fails at pfam step --> using cluster one
-#     resources:
-#         account = "pengel_beemicrophage",
-#         mem_mb = 100000,
-#         runtime= "01:00:00"
-#     shell:
-#         #"(DRAM-setup.py import_config --config_loc {input.config}) 2> {log}; " #useful only if using conda dram_env
-#         "source /etc/profile.d/lmodstacks.sh; " #import modules for DRAM
-#         "export PATH=/dcsrsoft/spack/external/dram/v1.2.4/bin:$PATH; "
-#         "dcsrsoft use old; "
-#         "module load gcc/9.3.0 python; "
-#         "module load hmmer mmseqs2 prodigal infernal trnascan-se barrnap; "
-#         "(DRAM.py annotate -i {input.asmbl} \
-#          -o {output.dir} --min_contig_size 999 \
-#          --threads {threads} --verbose \
-#          --checkm_quality {input.checkm}) 2> {log}" #annotate genomes with DRAM
-
-# rule DRAM_distill:
-#     input:
-#         dir="../results/genomes_anntations/{sample}_annot_genome"
-#     output:
-#         dir=directory("../results/genomes_anntations/{sample}_distill")
-#     log:
-#         "logs/annot_QC/dram/{sample}_distill.log"
-#     threads: 10
-#     # conda:
-#     #     "envs/dram.yaml" TODO does not work fails at pfam step --> using cluster one
-#     resources:
-#         account = "pengel_beemicrophage",
-#         mem_mb = 10000,
-#         runtime= "01:00:00"
-#     shell:
-#         #"(DRAM-setup.py import_config --config_loc {input.config}) 2> {log}; " #useful only if using conda dram_env
-#         "source /etc/profile.d/lmodstacks.sh; " #import modules for DRAM
-#         "export PATH=/dcsrsoft/spack/external/dram/v1.2.4/bin:$PATH; "
-#         "dcsrsoft use old; "
-#         "module load gcc/9.3.0 python; "
-#         "module load hmmer mmseqs2 prodigal infernal trnascan-se barrnap; "
-#         "(DRAM.py distill -i {input.dir}/annotations.tsv -o {output} --trna_path {input.dir}/trnas.tsv --rrna_path {input.dir}/rrnas.tsv) 2> {log}"
-
-# ###################################DEFENSE SYSTEMS ##########################################################################
-# rule DF_launch:
-#     input:
-#         faa="../results/genomes_anntations/{sample}_annot_genome/genes.faa"
-#     output:
-#         directory("../results/AVD_output/DF_output/{sample}_DF_output")
-#     conda:
-#         "envs/DF_env.yaml"
-#     threads: 10
-#     log:
-#         "logs/defense_systems/DF/{sample}_DF.log"
-#     resources:
-#         account = "pengel_beemicrophage",
-#         mem_mb = 10000,
-#         runtime= "00:30:00"
-#     shell:
-#         #"defense-finder update; " # run only the first time you launch this ule, Idk how to make it more elegant
-#         "(defense-finder run {input.faa} --out-dir {output}) 2> {log}"
+rule DRAM_distill:
+    input:
+        fld = "../../results/annotation/DRAM_annotate/{sample}_DRAM",
+        config = "../config/dram-1.4.6_config.txt"
+    output:
+        directory("../../results/annotation/DRAM_distill/{sample}_DRAM_distill")
+    log:
+        "../../logs/annotation/distill/{sample}_distill.log"
+    benchmark:
+        "../../benchmarks/annotation/{sample}_dram_distill.benchmark"
+    threads: 8
+    conda:
+        "../envs/dram-1.4.6.yaml"
+    resources:
+        account = "pengel_general_data",
+        mem_mb = 10000,
+        runtime= "2h"
+    shell:
+        """
+        (DRAM-setup.py import_config --config_loc {input.config}) 2> {log}; 
+        (DRAM.py distill -i {input.fld}/annotations.tsv -o {output} --trna_path {input.fld}/trnas.tsv \
+        --rrna_path {input.fld}/rrnas.tsv) 2> {log}
+        """

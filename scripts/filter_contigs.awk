@@ -23,22 +23,22 @@ NF > 1 {
     #select contigs >= 1000 bp
     if (header[4] >= 1000){
         # rename contig sample_contigid_length
-        print ">"sample"_"header[2]"_"header[4] > fk
+        print ">"sample"_contig"header[2]"_len_"header[4] > fk
         for (i=2; i<=NF; i++){
             print $i > fk
         }
         #store contig stats
-        print sample"\t"header[2]"\t"header[4] > fs
+        print sample"\tcontig"header[2]"\t"header[4] > fs
     }
     #discard contigs < 1000 bp
     if (header[4] < 1000){
         # rename contig sample_CD_number
-        print ">"sample"_"header[2]"_"header[4] > fd
+        print ">"sample"_contig"header[2]"_len_"header[4] > fd
         for (i=2; i<=NF; i++){
             print $i > fd
         }
         #store contig stats
-        print sample"\t"header[2]"\t"header[4] > fs
+        print sample"\tcontig"header[2]"\t"header[4] > fs
     }
 }
 
