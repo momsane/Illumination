@@ -1,4 +1,4 @@
-#wd=/work/FAC/FBM/DMF/pengel/general_data/Illumina_genomes/workflow/scripts
+#wd=/work/FAC/FBM/DMF/pengel/general_data/20241106_Illumina_genomes/workflow/scripts
 #command to symlink scratch: ln -s /scratch/mgarci14 ../../results/scratch
 #workflow = scripts, envs, config
 #data
@@ -30,6 +30,7 @@ rule all:
         "../../results/preprocessing/fastqc_pretrim/all",
         # Second chunk: adapter trimming and assembly
         "../../results/preprocessing/fastqc_posttrim/all",
+        "../../results/preprocessing/read_loss.txt",
         "../../results/assembly/QC/multiquast",
         expand("../../results/assembly/spades/contigs_filtered/{sample}.fna", sample = SAMPLES_ASS),
         expand("../../results/assembly/assemblies_noname/{sample}.fna", sample = SAMPLES_ASS),
@@ -37,10 +38,12 @@ rule all:
         # Third chunk: annotation
         "../../results/checkm_plots",
         "../../results/gtdbtk_classify",
-        "../../results/annotation/DRAM_distill/ESL0755_DRAM_distill",
-        # expand("../../results/annotation/{sample}_DRAM_distill", sample = SAMPLES_ANNOT)
+        expand("../../results/annotation/DRAM/{sample}_DRAM", sample = SAMPLES_ANNOT),
+        expand("../../results/annotation/rRNAS/{sample}_rrnas.fna", sample = SAMPLES_ANNOT), # comment this line after requesting all inputs to avoid rerunning on samples for which rRNAs cannot be found
+        expand("../../results/annotation/RGI/{sample}", sample = SAMPLES_ANNOT),
+        expand("../../results/annotation/macsyfinder/{sample}", sample = SAMPLES_ANNOT),
+        "../../results/analysis/combined_gtdbtk_checkm.tsv"
 
-        
 # The pipeline assumes the reads from different lanes are already
 # concatenated into a single file 
 
@@ -293,6 +296,85 @@ rule multiqc_fastqc_pt:
     shell:
         "multiqc --interactive -f --ignore {params.ignore} -o {output} {input}"
 
+# Count number of reads in each fastq file after trimming.
+
+rule count_reads_pt:
+    input:
+        R1 = "../../results/preprocessing/trimmed_reads/{sample}_R1.trim.fastq.gz",
+        R2 = "../../results/preprocessing/trimmed_reads/{sample}_R2.trim.fastq.gz"
+    output:
+        tmp = temp("../../results/preprocessing/count_reads_pt/samples/count_reads_pt_{sample}.temp.txt"),
+        final = "../../results/preprocessing/count_reads_pt/samples/count_reads_pt_{sample}.txt"
+    conda:
+        "../envs/seqkit-2.6.1.yaml"
+    log:
+        "../../logs/preprocessing/count_reads_pt/samples/{sample}.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "1h",
+        mem_mb = 2000
+    shell:
+        """ 
+        seqkit stats -T -b -e {input.R1} > {output.tmp};
+        seqkit stats -T -b -e {input.R2} >> {output.tmp};
+        cat {output.tmp} | awk -v sample={wildcards.sample} 'NR == 2 {{print sample"\tR1\t"$0}}' > {output.final};
+        cat {output.tmp} | awk -v sample={wildcards.sample} 'NR == 2 {{print sample"\tR2\t"$0}}' >> {output.final}
+        """
+
+# Combining all the samples stats into one file 
+
+rule combine_readcounts_pt:
+    input:
+        expand("../../results/preprocessing/count_reads_pt/samples/count_reads_pt_{sample}.txt", sample = SAMPLES_ASS)
+    output:
+        "../../results/preprocessing/count_reads_pt/count_reads_pt.txt"
+    log:
+        "../../logs/preprocessing/count_reads_pt/combine_readcounts.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "30m",
+        mem_mb = 1000
+    shell:
+        """
+        echo -e "sample\tread\tfile\tformat\ttype\tnum_seqs\tsum_len\tmin_len\tavg_len\tmax_len" > {output};
+        echo {input} | xargs cat >> {output}
+        """
+
+# Compute number of reads lost during trimming
+
+rule loss_reads:
+    input:
+        bt = "../../results/preprocessing/count_reads_bt/count_reads_bt.txt",
+        pt = "../../results/preprocessing/count_reads_pt/count_reads_pt.txt"
+    output:
+        "../../results/preprocessing/read_loss.txt"
+    log:
+        "../../logs/preprocessing/read_loss.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        runtime = "10m",
+        mem_mb = 1000
+    run:
+        bt = pd.read_table(input.bt, sep='\t', header=0, index_col=None).drop('file', axis=1)
+        pt = pd.read_table(input.pt, sep='\t', header=0, index_col=None).drop('file', axis=1)
+        bt['set'] = bt['sample'] + bt['read']
+        pt['set'] = pt['sample'] + pt['read']
+        bt = bt.rename(columns={'num_seqs': 'num_seqs_bt', 'sum_len': 'sum_len_bt', 'min_len': 'min_len_bt', 'avg_len': 'avg_len_bt', 'max_len': 'max_len_bt'})
+        pt = pt.rename(columns={'num_seqs': 'num_seqs_pt', 'sum_len': 'sum_len_pt', 'min_len': 'min_len_pt', 'avg_len': 'avg_len_pt', 'max_len': 'max_len_pt'})
+        tot = pt.merge(bt, how = 'left', on = 'set')
+        tot.drop('set', axis=1)
+        tot['loss_seqs'] = tot['num_seqs_bt'] - tot['num_seqs_pt']
+        tot['loss_len'] = tot['sum_len_bt'] - tot['sum_len_pt']
+        tot['loss_seqs_perc'] = 100*tot['loss_seqs']/tot['num_seqs_bt']
+        tot['loss_len_perc'] = 100*tot['loss_len']/tot['sum_len_bt']
+        tot.to_csv(output[0], sep='\t', index=True)
+        
+
+############################ Assembly ############################
+
 rule spades:
     input:
         R1 = "../../results/preprocessing/trimmed_reads/{sample}_R1.trim.fastq.gz",
@@ -447,7 +529,7 @@ rule checkm:
     resources:
         account = "pengel_general_data",
         mem_mb = 100000,
-        runtime = "1h"
+        runtime = "24h"
     shell:
         """
         mkdir -p {params.tmpdir};
@@ -462,9 +544,11 @@ rule checkm:
 # Check the checkM output to see if the genomes seem complete
 # From here only complete genomes will be further processed
 
+############################ Classification & annotation ##########################################
+
 rule checkm_plots:
     input:
-        assemblies = expand("../../results/assembly/spades/contigs_filtered/{sample}.fna", sample = SAMPLES_ASS),
+        assemblies = expand("../../results/assembly/spades/contigs_filtered/{sample}.fna", sample = SAMPLES_ANNOT),
         dir_checkm = "../../results/checkm"
     output:
         fld = directory("../../results/checkm_plots")
@@ -483,15 +567,16 @@ rule checkm_plots:
         mem_mb = 2000,
         runtime= "20m"
     shell:
-        "checkm marker_plot {input.dir_checkm} {params.dir_asmbl} {output.fld} -x {params.extension} --image_type svg; "
-        "checkm coding_plot {input.dir_checkm} {params.dir_asmbl} {output.fld} 0 -x {params.extension} --image_type svg; "
-        "checkm gc_plot {params.dir_asmbl} {output.fld} 0 -x {params.extension} --image_type svg"
-
-############################ Classification & annotation ##########################################
+        """
+        checkm marker_plot {input.dir_checkm} {params.dir_asmbl} {output.fld} -x {params.extension} --image_type svg;
+        checkm coding_plot {input.dir_checkm} {params.dir_asmbl} {output.fld} 0 -x {params.extension} --image_type svg;
+        checkm gc_plot {params.dir_asmbl} {output.fld} 0 -x {params.extension} --image_type svg;
+        checkm nx_plot {params.dir_asmbl} {output.fld} -x {params.extension} --image_type svg
+        """
 
 rule gtdb_classify:
     input:
-        expand("../../results/assembly/spades/contigs_filtered/{sample}.fna", sample = SAMPLES_ASS)
+        expand("../../results/assembly/spades/contigs_filtered/{sample}.fna", sample = SAMPLES_ANNOT)
     output:
         fld = directory("../../results/gtdbtk_classify"),
         report = "../../results/gtdbtk_classify/classify/gtdbtk.bac120.summary.tsv"
@@ -511,7 +596,7 @@ rule gtdb_classify:
     resources:
         account = "pengel_general_data",
         mem_mb = 20000,
-        runtime = "1h"
+        runtime = "24h"
     shell:
         """
         mkdir -p {params.tmpdir};
@@ -519,52 +604,245 @@ rule gtdb_classify:
         --out_dir {output.fld} --extension {params.extension} --cpus {threads} --tmpdir {params.tmpdir}
         """
 
-rule DRAM_annot:
+rule DRAM:
     input:
         asmbl = "../../results/assembly/assemblies_noname/{sample}.fna",
         checkm = "../../results/checkm/checkm_report_extended.txt",
         gtdbtk = "../../results/gtdbtk_classify/classify/gtdbtk.bac120.summary.tsv",
         config = "../config/dram-1.4.6_config.txt"
     output:
-        directory("../../results/annotation/DRAM_annotate/{sample}_DRAM")
+        fld1 = directory("../../results/annotation/DRAM/{sample}_DRAM"),
+        fld2 = directory("../../results/annotation/DRAM/{sample}_DRAM/distill"),
+        annot = "../../results/annotation/DRAM/{sample}_DRAM/annotations.tsv",
+        faa = "../../results/annotation/DRAM/{sample}_DRAM/genes.faa",
+        fna = "../../results/annotation/DRAM/{sample}_DRAM/genes.fna",
+        gbk = "../../results/annotation/DRAM/{sample}_DRAM/genbank/{sample}.gbk",
+        scaff = "../../results/annotation/DRAM/{sample}_DRAM/scaffolds.fna",
+        gff = "../../results/annotation/DRAM/{sample}_DRAM/genes.gff",
+        met = "../../results/annotation/DRAM/{sample}_DRAM/distill/metabolism_summary.xlsx",
+        prod1 = "../../results/annotation/DRAM/{sample}_DRAM/distill/product.html",
+        prod2 = "../../results/annotation/DRAM/{sample}_DRAM/distill/product.tsv",
+        stats = "../../results/annotation/DRAM/{sample}_DRAM/distill/genome_stats.tsv"
+    params:
+        trnas = "../../results/annotation/DRAM/{sample}_DRAM/trnas.tsv",
+        rrnas = "../../results/annotation/DRAM/{sample}_DRAM/rrnas.tsv"
     log:
-        "../../logs/annotation/dram/{sample}_dram.log"
+        "../../logs/annotation/DRAM/{sample}_dram.log"
     conda:
         "../envs/dram-1.4.6.yaml"
     threads: 8
     resources:
         account = "pengel_general_data",
-        mem_mb = 100000,
-        runtime= "2h"
+        mem_mb = 30000,
+        runtime= "6h"
     shell:
         """
+        rm -rf {output.fld1};
         (DRAM-setup.py import_config --config_loc {input.config}) 2> {log};
-        (DRAM.py annotate -i {input.asmbl} \
-         -o {output} --min_contig_size 999 \
-         --threads {threads} --verbose \
-         --checkm_quality {input.checkm} --gtdb_taxonomy {input.gtdbtk}) 2> {log} 
-         """
+        (DRAM.py annotate -i {input.asmbl} -o {output.fld1} --min_contig_size 999 \
+        --checkm_quality {input.checkm} --gtdb_taxonomy {input.gtdbtk} --threads {threads} --verbose) 2> {log};
+        if [[ -f {params.trnas} && -f {params.rrnas} ]]; then
+            (DRAM.py distill -i {output.annot} -o {output.fld2} --trna_path {params.trnas} \
+            --rrna_path {params.rrnas}) 2>> {log}
+        elif [[ -f {params.trnas} && ! -f {params.rrnas} ]]; then
+            (DRAM.py distill -i {output.annot} -o {output.fld2} --trna_path {params.trnas}) 2>> {log}
+        elif [[ ! -f {params.trnas} && ! -f {params.rrnas} ]]; then
+            (DRAM.py distill -i {output.annot} -o {output.fld2}) 2>> {log}
+        fi
+        """
 
-rule DRAM_distill:
+rule extract_rrnas:
     input:
-        fld = "../../results/annotation/DRAM_annotate/{sample}_DRAM",
-        config = "../config/dram-1.4.6_config.txt"
+        "../../results/annotation/DRAM/{sample}_DRAM/scaffolds.fna"
     output:
-        directory("../../results/annotation/DRAM_distill/{sample}_DRAM_distill")
+        seqs = "../../results/annotation/rRNAS/{sample}_rrnas.fna",
+        gff = "../../results/annotation/rRNAS/{sample}_rrnas.gff"
+    params:
+        fld = "../../results/annotation/rRNAS",
+        king = "bac",
+        r16s = "../../results/annotation/rRNAS/{sample}_16S.fna"
     log:
-        "../../logs/annotation/distill/{sample}_distill.log"
-    benchmark:
-        "../../benchmarks/annotation/{sample}_dram_distill.benchmark"
-    threads: 8
+        "../../logs/annotation/barrnap/{sample}_barrnap.log"
     conda:
         "../envs/dram-1.4.6.yaml"
+    threads: 1
     resources:
         account = "pengel_general_data",
-        mem_mb = 10000,
-        runtime= "2h"
+        mem_mb = 2000,
+        runtime= "1h"
     shell:
         """
-        (DRAM-setup.py import_config --config_loc {input.config}) 2> {log}; 
-        (DRAM.py distill -i {input.fld}/annotations.tsv -o {output} --trna_path {input.fld}/trnas.tsv \
-        --rrna_path {input.fld}/rrnas.tsv) 2> {log}
+        mkdir -p {params.fld};
+        barrnap --threads {threads} --kingdom {params.king} --outseq {output.seqs} < {input} > {output.gff};
+        sed -i "s/>/>{wildcards.sample}|/g" {output.seqs};
+        if grep -Fq "16S" {output.seqs}
+        then
+            grep -A 1 "16S" {output.seqs} > {params.r16s}
+        else
+            echo "No 16S rRNA found"
+        fi
         """
+
+# remove all * from input fasta before passing it to rgi
+
+rule rgi:
+    input:
+        "../../results/annotation/DRAM/{sample}_DRAM/genes.faa"
+    output:
+        fld = directory("../../results/annotation/RGI/{sample}"),
+        raw = "../../results/annotation/RGI/{sample}/{sample}_RGI_raw.txt",
+        filtered = "../../results/annotation/RGI/{sample}/{sample}_RGI_filtered.txt"
+    params:
+        tmp = "../../results/annotation/RGI/{sample}/{sample}.faa.tmp",
+        db = "/work/FAC/FBM/DMF/pengel/general_data/mgarci14/RGI_db/card.json",
+        bn = "../../results/annotation/RGI/{sample}/{sample}_RGI_raw"
+    log:
+        "../../logs/annotation/RGI/{sample}_rgi.log"
+    conda:
+        "../envs/rgi-6.0.3.yaml"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        mem_mb = 4000,
+        runtime= "1h"
+    shell:
+        """
+        rgi load --card_json {params.db} --local;
+        sed 's/*//g' {input} > {params.tmp}
+        rgi main --input_sequence {params.tmp} --output_file {params.bn} --local --clean --include_loose -t protein -n {threads};
+        awk -F '\t' '($10>40) && ($21>70) {{print}}' {output.raw} > {output.filtered};
+        rm -rf {params.tmp}
+        """
+
+# If macsyfinder is installed with the latest version it works
+# the conda environment also contains biopython
+
+rule macsydata:
+    output:
+        fld = directory("../../results/annotation/macsyfinder/macsydata"),
+        file = "../../results/annotation/macsyfinder/macsydata/macsydata.txt"
+    log:
+        "../../logs/annotation/macsyfinder/macsydata.log"
+    conda:
+        "../envs/macsyfinder-2.1.4.yaml"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        mem_mb = 2000,
+        runtime= "15m"
+    shell:
+        """
+        mkdir -p {output.fld};
+        mkdir -p ${{CONDA_PREFIX}}/share/macsyfinder/models/profiles;
+        mkdir -p ${{CONDA_PREFIX}}/share/macsyfinder/models/definitions;
+        mkdir -p ${{CONDA_PREFIX}}/share/macsyfinder/doc/profiles;
+        mkdir -p ${{CONDA_PREFIX}}/share/macsyfinder/doc/definitions;
+        macsydata install --target ${{CONDA_PREFIX}}/share/macsyfinder TXSScan;
+        touch {output.file}
+        """
+
+# macsyfinder can run on both unordered and ordered genomes, but in the ordered mode more informative outputs are produced
+# normally the genes.faa file from DRAM is already ordered
+# if you start from a .faa file that did not come from DRAM (i.e. downloaded from NCBI), ensure the genes are correctly ordered
+
+rule reorder_genes:
+    input:
+        data = "../../results/annotation/macsyfinder/macsydata/macsydata.txt",
+        gff = "../../results/annotation/DRAM/{sample}_DRAM/genes.gff",
+        faa = "../../results/annotation/DRAM/{sample}_DRAM/genes.faa"
+    output:
+        "../../results/annotation/macsyfinder/ordered_genomes/{sample}_ordered.faa"
+    params:
+        fld = "../../results/annotation/macsyfinder/ordered_genomes"
+    conda:
+        "../envs/macsyfinder-2.1.4.yaml"
+    log:
+        "../../logs/annotation/macsyfinder/order_genes/{sample}.log"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        mem_mb = 2000,
+        runtime= "1h"
+    script:
+        "order_genes.py"
+
+rule macsyfinder:
+    input:
+        data = "../../results/annotation/macsyfinder/macsydata/macsydata.txt",
+        faa = "../../results/annotation/macsyfinder/ordered_genomes/{sample}_ordered.faa"
+    output:
+        directory("../../results/annotation/macsyfinder/{sample}")
+    log:
+        "../../logs/annotation/macsyfinder/{sample}_df.log"
+    conda:
+        "../envs/macsyfinder-2.1.4.yaml"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        mem_mb = 4000,
+        runtime= "1h"
+    shell:
+        """
+        macsyfinder --sequence-db {input.faa} -o {output} --models-dir ${{CONDA_PREFIX}}/share/macsyfinder --models TXSScan all --db-type ordered_replicon -w {threads} -vv
+        """
+        
+## There are currently issues with macsyfinder so I cannot run defense-finder (it needs macsyfinder)
+
+# rule defense_finder_update:
+#     output:
+#         fld = directory("../../results/annotation/defense-finder/update"),
+#         file = "../../results/annotation/defense-finder/update/update.txt"
+#     log:
+#         "../../logs/annotation/defense-finder/update.log"
+#     conda:
+#         "../envs/defense-finder-1.3.0.yaml"
+#     threads: 1
+#     resources:
+#         account = "pengel_general_data",
+#         mem_mb = 4000,
+#         runtime= "1h"
+#     shell:
+#         """
+#         mkdir -p {output.fld};
+#         defense-finder update;
+#         touch {output.file}
+#         """
+
+# rule defense_finder:
+#     input:
+#         update = "../../results/annotation/defense-finder/update/update.txt",
+#         faa = "../../results/annotation/DRAM/{sample}_DRAM/genes.faa"
+#     output:
+#         directory("../../results/annotation/defense-finder/{sample}")
+#     log:
+#         "../../logs/annotation/defense-finder/{sample}_df.log"
+#     conda:
+#         "../envs/defense-finder-1.3.0.yaml"
+#     threads: 1
+#     resources:
+#         account = "pengel_general_data",
+#         mem_mb = 4000,
+#         runtime= "1h"
+#     shell:
+#         """
+#         (defense-finder run {input.faa} --out-dir {output}) 2> {log}
+#         """
+
+rule combine_gtdbtk_checkm:
+    input:
+        checkm = "../../results/checkm/checkm_report_extended.txt",
+        gtdbtk = "../../results/gtdbtk_classify/classify/gtdbtk.bac120.summary.tsv",
+        script = "combine_gtdbtk_checkm.R"
+    output:
+        file = "../../results/analysis/combined_gtdbtk_checkm.tsv"
+    log:
+        "../../logs/combine_gtdbtk_checkm.log"
+    conda:
+        "../envs/R-4.3.2.yaml"
+    threads: 1
+    resources:
+        account = "pengel_general_data",
+        mem_mb = 500,
+        runtime= "20m"
+    script:
+        "combine_gtdbtk_checkm.R"
